@@ -1,0 +1,42 @@
+# Plan (internal only)
+plan.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller output
+dist/
+build/
+
+# Recovery output directories
+recovery_output/
+preview_output/
+
+# Scan artifacts
+scan_report.json
+.drt_checkpoint.json
+.drt_checkpoint.json.tmp
+*.bad_sectors.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
