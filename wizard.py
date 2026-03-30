@@ -1,0 +1,762 @@
+"""
+DataRecoveryTool — Interactive Terminal Wizard
+Run this file directly:  python wizard.py
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — Platform and Python version gate
+# ---------------------------------------------------------------------------
+
+def _bail(msg: str) -> None:
+    print(f"\n[ERROR] {msg}\n", file=sys.stderr)
+    input("Press Enter to exit...")
+    sys.exit(1)
+
+
+if sys.platform != "win32":
+    _bail(
+        "DataRecoveryTool requires Windows 10 or 11.\n"
+        "       Raw disk access is only available via Windows kernel APIs."
+    )
+
+if sys.version_info < (3, 11):
+    _bail(
+        f"Python 3.11+ is required. You are running {sys.version}.\n"
+        "       Download it from https://www.python.org/downloads/"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Dependency check / auto-install
+# ---------------------------------------------------------------------------
+
+REQUIRED = ["typer", "rich"]          # pywin32 is optional (only VSS needs it)
+
+def _check_deps() -> None:
+    missing = []
+    for pkg in REQUIRED:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+
+    if not missing:
+        return
+
+    print("\n" + "=" * 60)
+    print("  Missing dependencies: " + ", ".join(missing))
+    print("=" * 60)
+    ans = input("\n  Install them now? [Y/n]: ").strip().lower()
+    if ans in ("", "y", "yes"):
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+            )
+            print("  Installed successfully.\n")
+        except subprocess.CalledProcessError:
+            _bail(
+                "pip install failed.\n"
+                "       Run manually:  pip install " + " ".join(missing)
+            )
+    else:
+        _bail("Cannot continue without required packages.")
+
+
+_check_deps()
+
+# Now safe to import rich
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
+console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Admin check
+# ---------------------------------------------------------------------------
+
+def _is_admin() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _check_admin() -> None:
+    if _is_admin():
+        return
+
+    console.print()
+    console.print(Panel(
+        "[bold yellow]Not running as Administrator[/bold yellow]\n\n"
+        "Raw disk access requires elevated privileges.\n"
+        "Without admin rights, most recovery techniques will fail.\n\n"
+        "[bold]How to fix:[/bold]\n"
+        "  1. Close this window\n"
+        "  2. Right-click Command Prompt or PowerShell\n"
+        "  3. Select [bold cyan]'Run as administrator'[/bold cyan]\n"
+        "  4. Run:  [bold]python wizard.py[/bold]",
+        title="[red]Admin Required[/red]",
+        border_style="red",
+    ))
+    console.print()
+    ans = Prompt.ask(
+        "Continue anyway? Results will be limited",
+        choices=["y", "n"],
+        default="n",
+    )
+    if ans == "n":
+        sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _step_header(num: int, title: str) -> None:
+    console.print()
+    console.print(Rule(f"[bold cyan]Step {num}[/bold cyan] — {title}", style="cyan"))
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Choose recovery target
+# ---------------------------------------------------------------------------
+
+def _choose_target() -> dict:
+    """Returns {'mode': 'drive'|'virtual', 'value': <path string>}"""
+    _step_header(1, "Choose Recovery Target")
+
+    console.print("\nWhat do you want to recover from?\n")
+    console.print("  [bold cyan]1[/bold cyan]  A physical drive or partition (C:, D:, USB stick, etc.)")
+    console.print("  [bold cyan]2[/bold cyan]  A virtual disk image file (.vhd, .vhdx, .vmdk)")
+
+    while True:
+        choice = Prompt.ask("\nTarget type", choices=["1", "2"], default="1")
+        if choice == "1":
+            return _choose_drive()
+        else:
+            return _choose_virtual_disk()
+
+
+def _choose_drive() -> dict:
+    # Import lazily — ctypes.windll calls live inside functions, safe on import
+    try:
+        from drt.drives import get_physical_disks, list_drives
+        drives   = list_drives()
+        physical = get_physical_disks()
+    except Exception as exc:
+        console.print(f"\n[red]Could not enumerate drives: {exc}[/red]")
+        console.print("Make sure you are running as Administrator.")
+        drives, physical = [], []
+
+    if not drives and not physical:
+        console.print(
+            "\n[yellow]No drives detected.[/yellow]  "
+            "Enter a drive letter (e.g. C:) or physical disk path manually."
+        )
+        raw = Prompt.ask("Drive").strip()
+        path = ("\\\\.\\"+raw.upper()) if (len(raw) == 2 and raw[1] == ":") else raw
+        return {"mode": "drive", "value": path}
+
+    # Print logical drives table
+    t = Table(title="Logical Drives", show_lines=True)
+    t.add_column("#",          style="dim",    width=4)
+    t.add_column("Drive",      style="cyan",   width=8)
+    t.add_column("Label",      style="green")
+    t.add_column("Type",       style="yellow")
+    t.add_column("Filesystem", style="blue")
+    t.add_column("Total",      justify="right")
+    t.add_column("Free",       justify="right")
+    for i, d in enumerate(drives, 1):
+        t.add_row(
+            str(i),
+            d["letter"],
+            d["label"] or "(no label)",
+            d["drive_type_name"],
+            d["filesystem"] or "—",
+            _fmt_bytes(d["total_bytes"]),
+            _fmt_bytes(d["free_bytes"]),
+        )
+    console.print(t)
+
+    if physical:
+        p = Table(title="Physical Disks", show_lines=True)
+        p.add_column("#",     style="dim",   width=4)
+        p.add_column("Path",  style="cyan")
+        p.add_column("Model", style="green")
+        p.add_column("Size",  justify="right")
+        for j, disk in enumerate(physical, 1):
+            p.add_row(
+                f"P{j}",
+                disk["path"],
+                disk["model"],
+                _fmt_bytes(disk["size_bytes"]) if disk["size_bytes"] else "—",
+            )
+        console.print(p)
+
+    console.print("\nEnter an index (1, 2, …) or P1/P2/… for a physical disk.")
+    console.print("Or type a drive letter directly, e.g. [bold]C:[/bold]")
+
+    all_options = [d["letter"] for d in drives] + [d["path"] for d in physical]
+    while True:
+        raw = Prompt.ask("Select drive").strip()
+
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(drives):
+                path = "\\\\.\\"+drives[idx]["letter"]
+                return {"mode": "drive", "value": path}
+
+        if raw.upper().startswith("P") and raw[1:].isdigit():
+            idx = int(raw[1:]) - 1
+            if 0 <= idx < len(physical):
+                return {"mode": "drive", "value": physical[idx]["path"]}
+
+        normalized = raw.upper()
+        if len(normalized) == 2 and normalized[1] == ":":
+            return {"mode": "drive", "value": "\\\\.\\"+normalized}
+
+        if raw.startswith("\\\\.\\"):
+            return {"mode": "drive", "value": raw}
+
+        console.print("[red]Invalid selection — try again.[/red]")
+
+
+def _choose_virtual_disk() -> dict:
+    console.print("\nEnter the full path to the virtual disk file.")
+    console.print("Supported formats: [cyan].vhd  .vhdx  .vmdk[/cyan]")
+    while True:
+        raw = Prompt.ask("File path").strip().strip('"')
+        p = Path(raw)
+        if not p.exists():
+            console.print(f"[red]File not found: {raw}[/red]")
+            continue
+        if p.suffix.lower() not in (".vhd", ".vhdx", ".vmdk"):
+            console.print(f"[red]Unsupported format {p.suffix!r}. Use .vhd, .vhdx, or .vmdk.[/red]")
+            continue
+        return {"mode": "virtual", "value": str(p)}
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Scan depth
+# ---------------------------------------------------------------------------
+
+def _choose_depth() -> str:
+    _step_header(2, "Choose Scan Depth")
+
+    t = Table(show_lines=True)
+    t.add_column("Option", style="cyan",   width=12)
+    t.add_column("What it does", style="white")
+    t.add_column("Speed",  style="yellow", justify="right")
+    t.add_row("quick",      "NTFS MFT + FAT directory scan — finds recently deleted files",      "Fast")
+    t.add_row("deep",       "quick + Volume Shadow Copies + Recycle Bin + browser history",      "Medium")
+    t.add_row("full-carve", "deep + raw sector-by-sector scan — finds files even after format",  "Slow")
+    console.print(t)
+
+    return Prompt.ask(
+        "\nDepth",
+        choices=["quick", "deep", "full-carve"],
+        default="deep",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — File types
+# ---------------------------------------------------------------------------
+
+def _choose_types() -> list[str]:
+    _step_header(3, "Choose File Types to Recover")
+
+    from drt.types import all_groups, list_group_keys
+    groups = all_groups()
+    group_keys = list(groups.keys())
+
+    t = Table(show_lines=True)
+    t.add_column("#",           style="dim",   width=4)
+    t.add_column("Group",       style="cyan",  width=16)
+    t.add_column("Description", style="white")
+    t.add_column("Example extensions", style="dim")
+    for i, (key, data) in enumerate(groups.items(), 1):
+        exts = data["extensions"]
+        t.add_row(
+            str(i),
+            key,
+            data["description"],
+            ", ".join(exts[:8]) + (" …" if len(exts) > 8 else ""),
+        )
+    t.add_row("*", "all", "Everything above", "—")
+    console.print(t)
+
+    console.print("\nEnter comma-separated numbers (e.g. [bold]1,3[/bold]) or press Enter for [bold]all[/bold].")
+
+    while True:
+        raw = Prompt.ask("Type groups", default="all").strip()
+        if not raw or raw.lower() == "all":
+            return ["all"]
+
+        parts = [p.strip() for p in raw.split(",")]
+        selected: list[str] = []
+        ok = True
+        for p in parts:
+            if p.isdigit():
+                idx = int(p) - 1
+                if 0 <= idx < len(group_keys):
+                    selected.append(group_keys[idx])
+                else:
+                    console.print(f"[red]Invalid number: {p}[/red]")
+                    ok = False
+                    break
+            elif p.lower() in group_keys or p.lower() == "all":
+                selected.append(p.lower())
+            else:
+                console.print(f"[red]Unknown group: {p!r}[/red]")
+                ok = False
+                break
+        if ok and selected:
+            return selected
+
+
+# ---------------------------------------------------------------------------
+# Step 6 — Output directory
+# ---------------------------------------------------------------------------
+
+def _choose_output() -> str:
+    _step_header(4, "Output Directory")
+
+    desktop = Path.home() / "Desktop" / "recovered_files"
+    default = str(desktop)
+
+    console.print(f"\nRecovered files will be written here.")
+    console.print(f"Default: [cyan]{default}[/cyan]")
+
+    raw = Prompt.ask("Output directory", default=default).strip().strip('"')
+    return raw or default
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — Optional filters
+# ---------------------------------------------------------------------------
+
+def _choose_filters() -> dict:
+    _step_header(5, "Optional Filters (press Enter to skip each)")
+
+    console.print("\nFilters let you narrow down which files to recover.")
+    console.print("[dim]Leave blank to recover everything.[/dim]\n")
+
+    min_size = Prompt.ask("Minimum file size (e.g. 10KB, 1MB)", default="").strip() or None
+    max_size = Prompt.ask("Maximum file size (e.g. 500MB, 2GB)", default="").strip() or None
+    after    = Prompt.ask("Only files modified after  (YYYY-MM-DD)", default="").strip() or None
+    before   = Prompt.ask("Only files modified before (YYYY-MM-DD)", default="").strip() or None
+
+    return {"min_size": min_size, "max_size": max_size, "after": after, "before": before}
+
+
+# ---------------------------------------------------------------------------
+# Step 8 — Confirmation summary
+# ---------------------------------------------------------------------------
+
+def _confirm(target: dict, depth: str, types: list[str], output: str, filters: dict) -> bool:
+    _step_header(6, "Confirm and Start")
+
+    mode  = target["mode"]
+    value = target["value"]
+
+    t = Table(show_lines=True, title="Recovery Settings")
+    t.add_column("Setting", style="cyan")
+    t.add_column("Value",   style="white")
+    t.add_row("Target",      f"{'Drive' if mode == 'drive' else 'Virtual disk'}: {value}")
+    t.add_row("Scan depth",  depth)
+    t.add_row("File types",  ", ".join(types))
+    t.add_row("Output",      output)
+    if any(filters.values()):
+        active = {k: v for k, v in filters.items() if v}
+        t.add_row("Filters", "  ".join(f"{k}={v}" for k, v in active.items()))
+    console.print(t)
+
+    console.print()
+    return Confirm.ask("[bold]Start recovery now?[/bold]", default=True)
+
+
+# ---------------------------------------------------------------------------
+# Step 9 — Run
+# ---------------------------------------------------------------------------
+
+def _run(target: dict, depth: str, types: list[str], output: str, filters: dict) -> None:
+    console.print()
+    console.print(Rule("[bold green]Recovery in progress[/bold green]", style="green"))
+
+    # Ensure output directory
+    Path(output).mkdir(parents=True, exist_ok=True)
+
+    if target["mode"] == "virtual":
+        # Delegate to the typer CLI for virtual disk (VHD/VHDX/VMDK)
+        import subprocess as sp
+        cmd = [
+            sys.executable, "-m", "drt.main", "virtual-disk",
+            "--file", target["value"],
+            "--out",  output,
+            "--depth", depth,
+            "--types", ",".join(types),
+        ]
+        console.print(f"[dim]Running: {' '.join(cmd)}[/dim]\n")
+        sp.run(cmd)
+        return
+
+    # Physical drive — call _run_scan directly
+    from drt import artifacts, browser, carver, fat, mft, report, vss, writer
+    from drt import reader as disk_reader
+    from drt.checkpoint import CheckpointWriter, delete as checkpoint_delete
+    from drt.filters import make_filter, parse_date, parse_size
+    from drt.progress import ProgressTracker, make_dashboard
+    from drt.types import get_extensions_for_groups
+    import json, shutil, time
+
+    from rich.live import Live
+
+    drive = target["value"]
+
+    # Build filter
+    file_filter = None
+    try:
+        from drt.filters import make_filter, parse_size, parse_date
+        file_filter = make_filter(
+            min_size=parse_size(filters["min_size"]) if filters.get("min_size") else None,
+            max_size=parse_size(filters["max_size"]) if filters.get("max_size") else None,
+            after=parse_date(filters["after"])       if filters.get("after")    else None,
+            before=parse_date(filters["before"])     if filters.get("before")   else None,
+        )
+    except Exception:
+        pass
+
+    # Open disk
+    try:
+        handle = disk_reader.open_disk(drive)
+    except OSError as exc:
+        console.print(f"\n[bold red]Cannot open drive:[/bold red] {exc}")
+        console.print(
+            "\nThis usually means one of:\n"
+            "  • Not running as Administrator\n"
+            "  • The drive letter is wrong\n"
+            "  • The drive is disconnected\n"
+        )
+        input("Press Enter to exit...")
+        sys.exit(1)
+
+    total_bytes = disk_reader.get_disk_size(handle)
+    if total_bytes == 0:
+        console.print("[red]Could not determine disk size. Is the drive accessible?[/red]")
+        disk_reader.close_disk(handle)
+        sys.exit(1)
+
+    console.print(f"Drive size: [cyan]{_fmt_bytes(total_bytes)}[/cyan]\n")
+
+    wanted_extensions = get_extensions_for_groups(types)
+    patterns          = carver.build_search_patterns(types)
+    console.print(f"Loaded [cyan]{len(patterns)}[/cyan] file signature patterns.\n")
+
+    writer.ensure_structure(output)
+    scan_report  = report.new_report(drive, depth, types)
+    start_time   = time.monotonic()
+
+    # Drive letter for artifacts scan
+    stripped = drive.lstrip("\\").lstrip(".")
+    drive_letter = stripped[:2].upper() if len(stripped) >= 2 and stripped[1] == ":" else "C:"
+
+    files_found     = 0
+    bytes_recovered = 0
+    index           = 0
+    phases_done: list[str] = []
+
+    # Extension→group lookup
+    _ext_group: dict[str, str] = {}
+    def _group_for_ext(ext: str) -> str:
+        if not _ext_group:
+            from drt.types import all_groups as _ag
+            for gk, gv in _ag().items():
+                for e in gv["extensions"]:
+                    _ext_group.setdefault(e, gk)
+        return _ext_group.get(ext.lower(), "other")
+
+    tracker = ProgressTracker(total_bytes=total_bytes, drive=drive, current_phase="Initializing")
+    tracker.record_sample()
+
+    def _build_cp() -> dict:
+        return {
+            "tool": "DataRecoveryTool", "version": "0.1.0",
+            "drive": drive, "depth": depth, "type_groups": types,
+            "output_dir": output, "phases_completed": phases_done,
+            "carve_offset": tracker.carve_offset,
+            "files_found": files_found, "next_index": index + 1,
+        }
+
+    cw = CheckpointWriter(output, _build_cp, interval_seconds=60)
+    cw.start()
+
+    try:
+        with Live(make_dashboard(tracker), refresh_per_second=4, console=console) as live:
+
+            # Phase 1 — MFT
+            tracker.current_phase = "Phase 1/6: MFT Scan"
+            live.update(make_dashboard(tracker))
+            try:
+                for entry in mft.scan(handle, wanted_extensions):
+                    ext  = entry.get("extension", "")
+                    size = entry.get("size_bytes", 0)
+                    if file_filter and not file_filter(size, None):
+                        continue
+                    files_found += 1; index += 1; bytes_recovered += size
+                    tracker.files_by_group[_group_for_ext(ext)] = tracker.files_by_group.get(_group_for_ext(ext), 0) + 1
+                    tracker.recent_finds.append({"extension": ext, "name": entry.get("name", f"mft_{index}"), "size_bytes": size, "offset_or_path": f"MFT {entry.get('mft_record','?')}"})
+                    content = entry.get("resident_data", b"") or mft.extract_file_content(handle, entry.get("data_runs",[]), entry.get("bytes_per_cluster",0), size)
+                    out_path_str = str(writer.write_file(output, ext, content, index)) if content else "(metadata only)"
+                    report.add_found_file(scan_report, ext, 0, out_path_str, size)
+                    live.update(make_dashboard(tracker))
+            except Exception:
+                pass
+            phases_done.append("mft")
+
+            # Phase 2 — FAT
+            tracker.current_phase = "Phase 2/6: FAT Scan"
+            live.update(make_dashboard(tracker))
+            try:
+                fat_bpb   = fat.read_bpb(handle)
+                fat_table = fat.read_fat_table(handle, fat_bpb) if fat_bpb else []
+                entries   = list(fat.iter_deleted_entries(handle, fat_bpb, wanted_extensions)) if fat_bpb else fat.scan(handle, wanted_extensions)
+                for entry in entries:
+                    ext  = entry.get("extension", "")
+                    size = entry.get("size_bytes", 0)
+                    if file_filter and not file_filter(size, None):
+                        continue
+                    files_found += 1; index += 1; bytes_recovered += size
+                    tracker.files_by_group[_group_for_ext(ext)] = tracker.files_by_group.get(_group_for_ext(ext), 0) + 1
+                    tracker.recent_finds.append({"extension": ext, "name": entry.get("name", f"fat_{index}"), "size_bytes": size, "offset_or_path": f"cluster {entry.get('first_cluster','?')}"})
+                    content = b""
+                    if fat_bpb and fat_table:
+                        fc = entry.get("first_cluster", 0)
+                        if fc >= 2 and size > 0:
+                            clusters = fat.follow_cluster_chain(fat_table, fc)
+                            if clusters:
+                                content = fat.read_cluster_chain(handle, fat_bpb, clusters, size)
+                    out_path_str = str(writer.write_file(output, ext, content, index)) if content else "(metadata only)"
+                    report.add_found_file(scan_report, ext, 0, out_path_str, size)
+                    live.update(make_dashboard(tracker))
+            except Exception:
+                pass
+            phases_done.append("fat")
+
+            if depth in ("deep", "full-carve"):
+                # Phase 3 — VSS
+                tracker.current_phase = "Phase 3/6: Volume Shadow Copies"
+                live.update(make_dashboard(tracker))
+                try:
+                    for entry in vss.scan(wanted_extensions):
+                        ext  = entry.get("extension", "")
+                        size = entry.get("size_bytes", 0)
+                        src  = entry.get("path", "")
+                        if file_filter and not file_filter(size, None):
+                            continue
+                        files_found += 1; index += 1; bytes_recovered += size
+                        tracker.files_by_group[_group_for_ext(ext)] = tracker.files_by_group.get(_group_for_ext(ext), 0) + 1
+                        tracker.recent_finds.append({"extension": ext, "name": entry.get("name", f"vss_{index}"), "size_bytes": size, "offset_or_path": entry.get("shadow_id","")})
+                        out_path_str = "(copy failed)"
+                        if src and os.path.isfile(src):
+                            try:
+                                dest = writer.get_output_path(output, ext, index)
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(src, str(dest))
+                                out_path_str = str(dest)
+                            except Exception:
+                                pass
+                        report.add_found_file(scan_report, ext, 0, out_path_str, size)
+                        live.update(make_dashboard(tracker))
+                except Exception:
+                    pass
+                phases_done.append("vss")
+
+                # Phase 4 — Artifacts
+                tracker.current_phase = "Phase 4/6: Windows Artifacts"
+                live.update(make_dashboard(tracker))
+                try:
+                    for entry in artifacts.scan(drive_letter):
+                        ext  = entry.get("extension", "")
+                        size = entry.get("size_bytes", 0)
+                        if ext not in wanted_extensions and ext != "":
+                            continue
+                        if file_filter and not file_filter(size, None):
+                            continue
+                        files_found += 1; index += 1; bytes_recovered += size
+                        source = entry.get("source", "")
+                        if source == "recycle_bin":
+                            name = Path(entry.get("original_path", f"recycled_{index}")).name
+                            src_file = entry.get("r_file_path", "")
+                        elif source == "lnk":
+                            name = Path(entry.get("lnk_path", f"lnk_{index}")).name
+                            src_file = entry.get("lnk_path", "")
+                        else:
+                            name = f"artifact_{index}"
+                            src_file = entry.get("pf_path", "")
+                        group = _group_for_ext(ext) if ext else "artifacts"
+                        tracker.files_by_group[group] = tracker.files_by_group.get(group, 0) + 1
+                        tracker.recent_finds.append({"extension": ext, "name": name, "size_bytes": size, "offset_or_path": source})
+                        out_path_str = "(metadata only)"
+                        if src_file and os.path.isfile(src_file):
+                            try:
+                                dest = writer.get_output_path(output, ext or ".bin", index)
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(src_file, str(dest))
+                                out_path_str = str(dest)
+                            except Exception:
+                                pass
+                        report.add_found_file(scan_report, ext or ".bin", 0, out_path_str, size)
+                        live.update(make_dashboard(tracker))
+                except Exception:
+                    pass
+                phases_done.append("artifacts")
+
+                # Phase 5 — Browser data
+                tracker.current_phase = "Phase 5/6: Browser History"
+                live.update(make_dashboard(tracker))
+                try:
+                    browser_data = browser.scan()
+                    if browser_data:
+                        browser_base = Path(output) / "BrowserData"
+                        browser_base.mkdir(parents=True, exist_ok=True)
+                        for bname, history in browser_data.items():
+                            if not history:
+                                continue
+                            bdir = browser_base / bname
+                            bdir.mkdir(exist_ok=True)
+                            (bdir / "history.json").write_text(
+                                json.dumps(history, indent=2, default=str), encoding="utf-8"
+                            )
+                            tracker.files_by_group["browser"] = tracker.files_by_group.get("browser", 0) + len(history)
+                            files_found += len(history)
+                            tracker.recent_finds.append({"extension": ".json", "name": f"{bname}/history.json", "size_bytes": 0, "offset_or_path": f"{len(history)} URLs"})
+                            live.update(make_dashboard(tracker))
+                except Exception:
+                    pass
+                phases_done.append("browser")
+
+            # Phase 6 — Deep carve (always)
+            tracker.current_phase = "Phase 6/6: Deep Carve"
+            tracker.record_sample()
+            live.update(make_dashboard(tracker))
+
+            def _on_progress(processed: int, total: int) -> None:
+                tracker.bytes_scanned = processed
+                tracker.carve_offset  = processed
+                tracker.record_sample()
+
+            for hit in carver.carve_disk(handle, total_bytes, patterns, _on_progress):
+                raw_data = hit["chunk_data"][
+                    hit["disk_offset"] - hit["chunk_offset"]:
+                    hit["disk_offset"] - hit["chunk_offset"] + hit["estimated_size"]
+                ]
+                if not raw_data:
+                    continue
+                ext  = hit["extension"]
+                size = len(raw_data)
+                if file_filter and not file_filter(size, None):
+                    continue
+                files_found += 1; bytes_recovered += size; index += 1
+                tracker.files_by_group[_group_for_ext(ext)] = tracker.files_by_group.get(_group_for_ext(ext), 0) + 1
+                tracker.recent_finds.append({"extension": ext, "name": f"recovered_{index:04d}{ext}", "size_bytes": size, "offset_or_path": f"0x{hit['disk_offset']:X}"})
+                out_path = writer.write_file(output, ext, raw_data, index)
+                report.add_found_file(scan_report, ext, hit["disk_offset"], str(out_path), size)
+                live.update(make_dashboard(tracker))
+
+            tracker.bytes_scanned = total_bytes
+            tracker.current_phase = "Complete"
+            tracker.record_sample()
+            live.update(make_dashboard(tracker))
+
+    finally:
+        cw.stop()
+        disk_reader.close_disk(handle)
+
+    checkpoint_delete(output)
+    elapsed = time.monotonic() - start_time
+    report.finalize_report(scan_report, elapsed)
+    report_path = report.write_report(scan_report, output)
+
+    # Summary
+    console.print()
+    console.print(Rule("[bold green]Recovery Complete[/bold green]", style="green"))
+    console.print()
+
+    s = Table(title="Summary", show_lines=True)
+    s.add_column("Metric",  style="cyan")
+    s.add_column("Value",   style="white", justify="right")
+    s.add_row("Files found",      str(files_found))
+    s.add_row("Data recovered",   _fmt_bytes(bytes_recovered))
+    s.add_row("Duration",         f"{elapsed:.1f}s")
+    s.add_row("Output folder",    output)
+    s.add_row("Report",           str(report_path))
+    console.print(s)
+
+    if scan_report["stats"]["by_type"]:
+        bt = Table(title="Files by Type", show_lines=False)
+        bt.add_column("Extension", style="cyan")
+        bt.add_column("Count",     justify="right")
+        for ext_key, count in sorted(scan_report["stats"]["by_type"].items(), key=lambda kv: kv[1], reverse=True):
+            bt.add_row(f".{ext_key}", str(count))
+        console.print(bt)
+
+    console.print(f"\nAll recovered files are in: [bold cyan]{output}[/bold cyan]\n")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    console.print()
+    console.print(Panel(
+        "[bold white]DataRecoveryTool[/bold white]  v0.1.0\n"
+        "[dim]Recovers deleted, lost, or formatted files from drives and disk images.[/dim]",
+        border_style="cyan",
+    ))
+
+    _check_admin()
+
+    target  = _choose_target()
+    depth   = _choose_depth()
+    types   = _choose_types()
+    output  = _choose_output()
+    filters = _choose_filters()
+
+    if not _confirm(target, depth, types, output, filters):
+        console.print("\nCancelled.\n")
+        sys.exit(0)
+
+    try:
+        _run(target, depth, types, output, filters)
+    except KeyboardInterrupt:
+        console.print("\n\n[yellow]Scan interrupted by user.[/yellow]")
+        console.print(f"Partial results (if any) are in: [cyan]{output}[/cyan]")
+        console.print("Run [bold]python wizard.py[/bold] again to start fresh, or use [bold]drt resume[/bold] to continue.")
+    finally:
+        input("\nPress Enter to exit...")
+
+
+if __name__ == "__main__":
+    main()
