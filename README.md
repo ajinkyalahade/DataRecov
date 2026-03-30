@@ -14,18 +14,37 @@ A deep, Windows-native CLI tool for recovering deleted files, formatted drives, 
 
 ## Installation
 
-### Option A — Run from source (development)
-
 ```
 git clone <repo>
 cd DataRecoveryTool
 pip install -r requirements.txt
+```
+
+### Run as Administrator
+
+Raw disk access requires elevated privileges. Right-click Command Prompt or PowerShell → **Run as administrator**, then run your commands from there.
+
+---
+
+## Quick Start
+
+### Option A — Interactive wizard (recommended)
+
+```
+python wizard.py
+```
+
+The wizard handles everything: checks your Python version and dependencies, warns if you're not running as admin, then walks you through each choice (drive, scan depth, file types, output folder, optional filters) before starting. No need to memorise any commands.
+
+### Option B — CLI directly
+
+```
 python -m drt.main --help
 ```
 
-### Option B — Build a standalone `.exe` (recommended for deployment)
+All flags are optional on `drt scan` — omitting them also launches a step-by-step prompt.
 
-Install PyInstaller, then:
+### Build a standalone `.exe`
 
 ```
 pip install pyinstaller
@@ -34,51 +53,33 @@ pyinstaller --onefile --name drt drt/main.py
 
 The output `dist\drt.exe` runs on any Windows machine without Python installed.
 
-### Run as Administrator
-
-Right-click Command Prompt or PowerShell → **Run as administrator**, then run `drt`.
-
-Or from an existing elevated prompt:
-
-```
-drt --help
-```
-
 ---
 
-## Quick Start
+## CLI Quick Reference
 
-### 1. See what drives are available
+### See available drives
 
 ```
 drt list-drives
 ```
 
-Lists all logical drives and physical disks with label, filesystem, size, and free space.
-
-### 2. Preview what can be recovered (non-destructive)
+### Preview without writing anything
 
 ```
 drt preview --drive D: --depth deep --types images,documents
 ```
 
-Scans without writing anything. Shows a live dashboard of what would be recovered.
-
-### 3. Recover files
+### Recover files
 
 ```
 drt scan --drive D: --depth full-carve --out C:\recovery
 ```
 
-Runs a full deep scan and writes recovered files to `C:\recovery` in an organised folder structure.
-
-### 4. Resume an interrupted scan
+### Resume an interrupted scan
 
 ```
 drt resume --out C:\recovery
 ```
-
-Picks up exactly where it left off if a scan was interrupted.
 
 ---
 
