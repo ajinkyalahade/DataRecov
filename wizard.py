@@ -91,31 +91,37 @@ def _is_admin() -> bool:
         return False
 
 
-def _check_admin() -> None:
+def _ensure_admin() -> None:
+    """If not running as admin, trigger a UAC elevation prompt and relaunch."""
     if _is_admin():
         return
 
     console.print()
-    console.print(Panel(
-        "[bold yellow]Not running as Administrator[/bold yellow]\n\n"
-        "Raw disk access requires elevated privileges.\n"
-        "Without admin rights, most recovery techniques will fail.\n\n"
-        "[bold]How to fix:[/bold]\n"
-        "  1. Close this window\n"
-        "  2. Right-click Command Prompt or PowerShell\n"
-        "  3. Select [bold cyan]'Run as administrator'[/bold cyan]\n"
-        "  4. Run:  [bold]python wizard.py[/bold]",
-        title="[red]Admin Required[/red]",
-        border_style="red",
-    ))
-    console.print()
-    ans = Prompt.ask(
-        "Continue anyway? Results will be limited",
-        choices=["y", "n"],
-        default="n",
+    console.print("[cyan]Administrator privileges required — requesting elevation...[/cyan]")
+    console.print("[dim]A UAC prompt will appear. Click [bold]Yes[/bold] to continue.[/dim]\n")
+
+    import ctypes
+    args = subprocess.list2cmdline(sys.argv)
+    ret = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        sys.executable,
+        args,
+        None,
+        1,  # SW_SHOWNORMAL
     )
-    if ans == "n":
-        sys.exit(0)
+
+    if ret <= 32:
+        # ShellExecuteW returns a value > 32 on success; ≤ 32 means error/cancel.
+        console.print(
+            "\n[bold red]Elevation was cancelled or failed.[/bold red]\n"
+            "Run from an [bold]Administrator[/bold] command prompt to continue.\n"
+        )
+        input("Press Enter to exit...")
+        sys.exit(1)
+
+    # The elevated process is launching — exit this non-elevated instance.
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -978,7 +984,7 @@ def main() -> None:
         border_style="cyan",
     ))
 
-    _check_admin()
+    _ensure_admin()
 
     target  = _choose_target()
     depth   = _choose_depth()
