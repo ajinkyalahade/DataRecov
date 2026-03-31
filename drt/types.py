@@ -94,6 +94,7 @@ _GROUPS: dict[str, TypeGroup] = {
 
 def get_group(key: str) -> TypeGroup:
     """Return a single type group by key, including computed 'all'."""
+    key = key.lower()
     if key == "all":
         return _build_all_group()
     if key not in _GROUPS:

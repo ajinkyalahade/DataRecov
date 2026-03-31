@@ -74,6 +74,12 @@ class CheckpointWriter:
 
     def start(self) -> None:
         self._stop_event.clear()
+        # Recreate the thread so start() is safe to call more than once.
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="CheckpointWriter",
+        )
         self._thread.start()
 
     def stop(self) -> None:

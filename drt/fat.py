@@ -145,6 +145,8 @@ def _read_cluster(handle: int, cluster: int, bpb: dict) -> bytes:
 
 def _parse_lfn_entry(entry: bytes) -> str:
     """Extract the UTF-16LE characters from a LFN directory entry (32 bytes)."""
+    if len(entry) < 32:
+        return ""
     # LFN layout: chars at offsets 1-10 (5 chars), 14-25 (6 chars), 28-31 (2 chars)
     chars = entry[1:11] + entry[14:26] + entry[28:32]
     name = chars.decode("utf-16-le", errors="replace")

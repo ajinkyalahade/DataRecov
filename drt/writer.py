@@ -158,9 +158,13 @@ def get_output_path(base_dir: str, extension: str, index: int) -> Path:
 
     Example: base_dir/Images/jpg/recovered_0001.jpg
     """
-    ext_clean = extension.lstrip(".").lower()
-    category  = _category_for(extension)
-    filename  = f"recovered_{index:04d}{extension.lower()}"
+    # Normalise: ensure the extension always starts with a dot
+    ext = extension.lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    ext_clean = ext.lstrip(".")
+    category  = _category_for(ext)
+    filename  = f"recovered_{index:04d}{ext}" if ext else f"recovered_{index:04d}.bin"
     return Path(base_dir) / category / ext_clean / filename
 
 

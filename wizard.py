@@ -432,6 +432,34 @@ def _smart_defaults(types: list[str]) -> tuple[str, str]:
     return min_val, max_val
 
 
+def _ask_size(prompt: str, default: str) -> str | None:
+    """Prompt for a file size string, re-asking if the format is invalid."""
+    from drt.filters import parse_size
+    while True:
+        raw = Prompt.ask(prompt, default=default).strip()
+        if not raw:
+            return None
+        try:
+            parse_size(raw)
+            return raw
+        except ValueError:
+            console.print(f"[red]Invalid size {raw!r}. Use e.g. 10KB, 5MB, 2GB.[/red]")
+
+
+def _ask_date(prompt: str) -> str | None:
+    """Prompt for a YYYY-MM-DD date string, re-asking if the format is invalid."""
+    from drt.filters import parse_date
+    while True:
+        raw = Prompt.ask(prompt, default="").strip()
+        if not raw:
+            return None
+        try:
+            parse_date(raw)
+            return raw
+        except ValueError:
+            console.print(f"[red]Invalid date {raw!r}. Use YYYY-MM-DD, e.g. 2024-01-31.[/red]")
+
+
 def _choose_filters(types: list[str]) -> dict:
     _step_header(5, "File Size Filters")
 
@@ -439,18 +467,18 @@ def _choose_filters(types: list[str]) -> dict:
 
     if default_min or default_max:
         console.print(
-            f"\n[dim]Smart defaults applied based on selected types "
-            f"(min=[cyan]{default_min or 'none'}[/cyan], "
-            f"max=[cyan]{default_max or 'none'}[/cyan]). "
+            f"\n[dim]Smart defaults for selected types: "
+            f"min=[cyan]{default_min or 'none'}[/cyan], "
+            f"max=[cyan]{default_max or 'none'}[/cyan]. "
             f"Press Enter to accept or type a new value.[/dim]"
         )
     else:
         console.print("\n[dim]Leave blank to recover files of any size.[/dim]")
 
-    min_size = Prompt.ask("Minimum file size (e.g. 10KB, 1MB)", default=default_min).strip() or None
-    max_size = Prompt.ask("Maximum file size (e.g. 500MB, 2GB)", default=default_max).strip() or None
-    after    = Prompt.ask("Only files modified after  (YYYY-MM-DD, or blank)", default="").strip() or None
-    before   = Prompt.ask("Only files modified before (YYYY-MM-DD, or blank)", default="").strip() or None
+    min_size = _ask_size("Minimum file size (e.g. 10KB, 1MB)", default_min)
+    max_size = _ask_size("Maximum file size (e.g. 500MB, 2GB)", default_max)
+    after    = _ask_date("Only files modified after  (YYYY-MM-DD, or blank)")
+    before   = _ask_date("Only files modified before (YYYY-MM-DD, or blank)")
 
     return {"min_size": min_size, "max_size": max_size, "after": after, "before": before}
 
@@ -711,8 +739,8 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                         out_path_str = str(writer.write_file(run_dir, ext, content, index)) if content else "(metadata only)"
                         report.add_found_file(scan_report, ext, 0, out_path_str, size)
                         _refresh()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    console.print(f"[yellow]Warning: MFT scan error: {exc}[/yellow]")
                 phases_done.append("mft")
                 cp_mod.save(run_dir, _build_cp())
 
@@ -744,8 +772,8 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                         out_path_str = str(writer.write_file(run_dir, ext, content, index)) if content else "(metadata only)"
                         report.add_found_file(scan_report, ext, 0, out_path_str, size)
                         _refresh()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    console.print(f"[yellow]Warning: FAT scan error: {exc}[/yellow]")
                 phases_done.append("fat")
                 cp_mod.save(run_dir, _build_cp())
 
@@ -775,8 +803,8 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                                     pass
                             report.add_found_file(scan_report, ext, 0, out_path_str, size)
                             _refresh()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        console.print(f"[yellow]Warning: VSS scan error: {exc}[/yellow]")
                     phases_done.append("vss")
                     cp_mod.save(run_dir, _build_cp())
 
@@ -814,8 +842,8 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                                     pass
                             report.add_found_file(scan_report, ext or ".bin", 0, out_path_str, size)
                             _refresh()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        console.print(f"[yellow]Warning: artifact scan error: {exc}[/yellow]")
                     phases_done.append("artifacts")
                     cp_mod.save(run_dir, _build_cp())
 
@@ -833,22 +861,27 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                                     continue
                                 bdir = browser_base / bname
                                 bdir.mkdir(exist_ok=True)
-                                (bdir / "history.json").write_text(
+                                hist_path = bdir / "history.json"
+                                hist_path.write_text(
                                     json.dumps(history, indent=2, default=str),
                                     encoding="utf-8",
                                 )
                                 n = len(history)
                                 tracker.files_by_group["browser"] = tracker.files_by_group.get("browser", 0) + n
                                 files_found += n
+                                index += 1
                                 tracker.recent_finds.append({
                                     "extension": ".json",
                                     "name": f"{bname}/history.json",
                                     "size_bytes": 0,
                                     "offset_or_path": f"{n} URLs",
                                 })
+                                report.add_found_file(
+                                    scan_report, ".json", 0, str(hist_path), 0
+                                )
                                 _refresh()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        console.print(f"[yellow]Warning: browser scan failed: {exc}[/yellow]")
                     phases_done.append("browser")
                     cp_mod.save(run_dir, _build_cp())
 
