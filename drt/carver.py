@@ -187,25 +187,30 @@ def carve_disk(
     total_bytes: int,
     patterns: list[dict],
     progress_callback: Callable[[int, int], None] | None = None,
+    start_offset: int = 0,
 ) -> Iterator[dict]:
     """
-    Iterate over the entire disk in 1 MB chunks and yield carved file hits.
+    Iterate over the disk in 1 MB chunks and yield carved file hits.
 
-    progress_callback(bytes_processed, total_bytes) is called after each chunk
-    if provided.
+    start_offset — skip bytes before this position (for resume).
+    progress_callback(bytes_processed, total_bytes) is called after each chunk.
 
     Each yielded dict contains:
         disk_offset    (int)   — byte offset on disk
         extension      (str)   — e.g. ".jpg"
         estimated_size (int)   — bytes to extract (capped at next hit or max_size)
-        chunk_data     (bytes) — the 1 MB chunk containing this hit; slice from
-                                 (disk_offset - chunk_offset) to extract the data
+        max_size       (int)   — the per-extension extraction budget
+        chunk_data     (bytes) — the 1 MB chunk containing this hit
         chunk_offset   (int)   — absolute offset of chunk_data on disk
     """
     CHUNK_SIZE = 1024 * 1024  # 1 MB
-    bytes_processed = 0
+    # Align start_offset down to a chunk boundary so we don't miss headers
+    aligned_start = (start_offset // CHUNK_SIZE) * CHUNK_SIZE
+    bytes_processed = aligned_start
 
-    for chunk_offset, data in disk_reader.iter_sectors(handle, total_bytes, CHUNK_SIZE):
+    for chunk_offset, data in disk_reader.iter_sectors(
+        handle, total_bytes, CHUNK_SIZE, start_offset=aligned_start
+    ):
         hits = carve_chunk(data, chunk_offset, patterns)
 
         # Cap each hit's estimated_size to the start of the next hit in this chunk,
@@ -221,6 +226,7 @@ def carve_disk(
                 "disk_offset":    hit["disk_offset"],
                 "extension":      hit["extension"],
                 "estimated_size": max(capped, 0),
+                "max_size":       hit["max_size"],
                 "chunk_data":     data,
                 "chunk_offset":   chunk_offset,
             }

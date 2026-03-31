@@ -36,7 +36,7 @@ if sys.version_info < (3, 11):
 # Step 1 — Dependency check / auto-install
 # ---------------------------------------------------------------------------
 
-REQUIRED = ["typer", "rich"]          # pywin32 is optional (only VSS needs it)
+REQUIRED = ["typer", "rich"]
 
 def _check_deps() -> None:
     missing = []
@@ -70,13 +70,11 @@ def _check_deps() -> None:
 
 _check_deps()
 
-# Now safe to import rich
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
 from rich.table import Table
-from rich.text import Text
 
 console = Console()
 
@@ -137,6 +135,46 @@ def _step_header(num: int, title: str) -> None:
     console.print(Rule(f"[bold cyan]Step {num}[/bold cyan] — {title}", style="cyan"))
 
 
+def _drive_letter_from_path(drive_path: str) -> str:
+    """
+    Extract the drive letter (e.g. 'D:') from a Windows disk path.
+    Handles: '\\\\.\\D:' and 'D:' forms.
+    """
+    if drive_path.startswith("\\\\.\\"):
+        candidate = drive_path[4:]          # e.g. "D:" or "PhysicalDrive0"
+        if len(candidate) >= 2 and candidate[1] == ":":
+            return candidate[:2].upper()
+    elif len(drive_path) >= 2 and drive_path[1] == ":":
+        return drive_path[:2].upper()
+    return "C:"                             # fallback for physical disk paths
+
+
+# ---------------------------------------------------------------------------
+# EOF trimming — truncate carved bytes to the file's natural end
+# ---------------------------------------------------------------------------
+
+_EOF_MARKERS: dict[str, list[bytes]] = {
+    ".jpg":  [b"\xff\xd9"],
+    ".jpeg": [b"\xff\xd9"],
+    ".png":  [b"\x49\x45\x4e\x44\xae\x42\x60\x82"],   # IEND chunk CRC
+    ".gif":  [b"\x00\x3b"],
+    ".pdf":  [b"%%EOF"],
+}
+
+
+def _trim_to_eof(data: bytes, extension: str) -> bytes:
+    """Return data truncated at the first EOF marker for the given extension."""
+    markers = _EOF_MARKERS.get(extension.lower())
+    if not markers:
+        return data
+    best = len(data)
+    for marker in markers:
+        pos = data.find(marker)
+        if pos != -1:
+            best = min(best, pos + len(marker))
+    return data[:best]
+
+
 # ---------------------------------------------------------------------------
 # Step 3 — Choose recovery target
 # ---------------------------------------------------------------------------
@@ -158,7 +196,6 @@ def _choose_target() -> dict:
 
 
 def _choose_drive() -> dict:
-    # Import lazily — ctypes.windll calls live inside functions, safe on import
     try:
         from drt.drives import get_physical_disks, list_drives
         drives   = list_drives()
@@ -174,10 +211,10 @@ def _choose_drive() -> dict:
             "Enter a drive letter (e.g. C:) or physical disk path manually."
         )
         raw = Prompt.ask("Drive").strip()
-        path = ("\\\\.\\"+raw.upper()) if (len(raw) == 2 and raw[1] == ":") else raw
-        return {"mode": "drive", "value": path}
+        if len(raw) == 2 and raw[1] == ":":
+            return {"mode": "drive", "value": "\\\\.\\"+raw.upper()}
+        return {"mode": "drive", "value": raw}
 
-    # Print logical drives table
     t = Table(title="Logical Drives", show_lines=True)
     t.add_column("#",          style="dim",    width=4)
     t.add_column("Drive",      style="cyan",   width=8)
@@ -214,31 +251,37 @@ def _choose_drive() -> dict:
         console.print(p)
 
     console.print("\nEnter an index (1, 2, …) or P1/P2/… for a physical disk.")
-    console.print("Or type a drive letter directly, e.g. [bold]C:[/bold]")
+    console.print("Or type a drive letter directly, e.g. [bold]D:[/bold]")
 
-    all_options = [d["letter"] for d in drives] + [d["path"] for d in physical]
     while True:
         raw = Prompt.ask("Select drive").strip()
 
+        # Numeric index → logical drive
         if raw.isdigit():
             idx = int(raw) - 1
             if 0 <= idx < len(drives):
-                path = "\\\\.\\"+drives[idx]["letter"]
-                return {"mode": "drive", "value": path}
+                letter = drives[idx]["letter"]          # e.g. "D:"
+                return {"mode": "drive", "value": "\\\\.\\"+letter}
+            console.print("[red]Invalid index.[/red]")
+            continue
 
+        # P1/P2 → physical disk
         if raw.upper().startswith("P") and raw[1:].isdigit():
             idx = int(raw[1:]) - 1
             if 0 <= idx < len(physical):
                 return {"mode": "drive", "value": physical[idx]["path"]}
+            console.print("[red]Invalid physical disk index.[/red]")
+            continue
 
-        normalized = raw.upper()
-        if len(normalized) == 2 and normalized[1] == ":":
-            return {"mode": "drive", "value": "\\\\.\\"+normalized}
+        # Plain letter "D:" or "D"
+        letter = raw.upper().rstrip(":\\")
+        if len(letter) == 1 and letter.isalpha():
+            return {"mode": "drive", "value": f"\\\\.\\{letter}:"}
 
         if raw.startswith("\\\\.\\"):
             return {"mode": "drive", "value": raw}
 
-        console.print("[red]Invalid selection — try again.[/red]")
+        console.print("[red]Not recognised — try again.[/red]")
 
 
 def _choose_virtual_disk() -> dict:
@@ -264,19 +307,15 @@ def _choose_depth() -> str:
     _step_header(2, "Choose Scan Depth")
 
     t = Table(show_lines=True)
-    t.add_column("Option", style="cyan",   width=12)
+    t.add_column("Option",       style="cyan",   width=12)
     t.add_column("What it does", style="white")
-    t.add_column("Speed",  style="yellow", justify="right")
+    t.add_column("Speed",        style="yellow", justify="right")
     t.add_row("quick",      "NTFS MFT + FAT directory scan — finds recently deleted files",      "Fast")
     t.add_row("deep",       "quick + Volume Shadow Copies + Recycle Bin + browser history",      "Medium")
     t.add_row("full-carve", "deep + raw sector-by-sector scan — finds files even after format",  "Slow")
     console.print(t)
 
-    return Prompt.ask(
-        "\nDepth",
-        choices=["quick", "deep", "full-carve"],
-        default="deep",
-    )
+    return Prompt.ask("\nDepth", choices=["quick", "deep", "full-carve"], default="deep")
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +325,8 @@ def _choose_depth() -> str:
 def _choose_types() -> list[str]:
     _step_header(3, "Choose File Types to Recover")
 
-    from drt.types import all_groups, list_group_keys
-    groups = all_groups()
+    from drt.types import all_groups
+    groups     = all_groups()
     group_keys = list(groups.keys())
 
     t = Table(show_lines=True)
@@ -353,19 +392,65 @@ def _choose_output() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Step 7 — Optional filters
+# Step 7 — Filters (with smart defaults per type group)
 # ---------------------------------------------------------------------------
 
-def _choose_filters() -> dict:
-    _step_header(5, "Optional Filters (press Enter to skip each)")
+# Per-group smart defaults: (min_size_label, max_size_label) or None for no default
+_TYPE_DEFAULTS: dict[str, tuple[str, str]] = {
+    "images": ("50KB",  "50MB"),   # skip tiny thumbnails/icons; cap at 50 MB
+    "videos": ("5MB",   "4GB"),    # skip short clips/thumbnails; cap at 4 GB
+    "audio":  ("500KB", "500MB"),  # skip short beeps
+}
 
-    console.print("\nFilters let you narrow down which files to recover.")
-    console.print("[dim]Leave blank to recover everything.[/dim]\n")
 
-    min_size = Prompt.ask("Minimum file size (e.g. 10KB, 1MB)", default="").strip() or None
-    max_size = Prompt.ask("Maximum file size (e.g. 500MB, 2GB)", default="").strip() or None
-    after    = Prompt.ask("Only files modified after  (YYYY-MM-DD)", default="").strip() or None
-    before   = Prompt.ask("Only files modified before (YYYY-MM-DD)", default="").strip() or None
+def _smart_defaults(types: list[str]) -> tuple[str, str]:
+    """
+    Return (min_size, max_size) string defaults for the given type groups.
+    Picks the broadest range that covers all selected groups.
+    Returns ("", "") when no smart default applies.
+    """
+    if "all" in types:
+        return "", ""
+
+    mins, maxs = [], []
+    for t in types:
+        if t in _TYPE_DEFAULTS:
+            mn, mx = _TYPE_DEFAULTS[t]
+            mins.append(mn)
+            maxs.append(mx)
+
+    if not mins:
+        return "", ""
+
+    # Use smallest min (most permissive) and largest max
+    def _to_bytes(s: str) -> int:
+        from drt.filters import parse_size
+        return parse_size(s)
+
+    min_val = min(mins, key=_to_bytes)
+    max_val = max(maxs, key=_to_bytes)
+    return min_val, max_val
+
+
+def _choose_filters(types: list[str]) -> dict:
+    _step_header(5, "File Size Filters")
+
+    default_min, default_max = _smart_defaults(types)
+
+    if default_min or default_max:
+        console.print(
+            f"\n[dim]Smart defaults applied based on selected types "
+            f"(min=[cyan]{default_min or 'none'}[/cyan], "
+            f"max=[cyan]{default_max or 'none'}[/cyan]). "
+            f"Press Enter to accept or type a new value.[/dim]"
+        )
+    else:
+        console.print("\n[dim]Leave blank to recover files of any size.[/dim]")
+
+    min_size = Prompt.ask("Minimum file size (e.g. 10KB, 1MB)", default=default_min).strip() or None
+    max_size = Prompt.ask("Maximum file size (e.g. 500MB, 2GB)", default=default_max).strip() or None
+    after    = Prompt.ask("Only files modified after  (YYYY-MM-DD, or blank)", default="").strip() or None
+    before   = Prompt.ask("Only files modified before (YYYY-MM-DD, or blank)", default="").strip() or None
 
     return {"min_size": min_size, "max_size": max_size, "after": after, "before": before}
 
@@ -377,21 +462,19 @@ def _choose_filters() -> dict:
 def _confirm(target: dict, depth: str, types: list[str], output: str, filters: dict) -> bool:
     _step_header(6, "Confirm and Start")
 
-    mode  = target["mode"]
-    value = target["value"]
-
     t = Table(show_lines=True, title="Recovery Settings")
     t.add_column("Setting", style="cyan")
     t.add_column("Value",   style="white")
+    mode  = target["mode"]
+    value = target["value"]
     t.add_row("Target",      f"{'Drive' if mode == 'drive' else 'Virtual disk'}: {value}")
     t.add_row("Scan depth",  depth)
     t.add_row("File types",  ", ".join(types))
     t.add_row("Output",      output)
-    if any(filters.values()):
-        active = {k: v for k, v in filters.items() if v}
+    active = {k: v for k, v in filters.items() if v}
+    if active:
         t.add_row("Filters", "  ".join(f"{k}={v}" for k, v in active.items()))
     console.print(t)
-
     console.print()
     return Confirm.ask("[bold]Start recovery now?[/bold]", default=True)
 
@@ -400,16 +483,32 @@ def _confirm(target: dict, depth: str, types: list[str], output: str, filters: d
 # Step 9 — Run
 # ---------------------------------------------------------------------------
 
+def _build_filter(filters: dict):
+    """Build a size+date filter function. Returns None if no filters active."""
+    from drt.filters import make_filter, parse_date, parse_size
+    min_sz  = parse_size(filters["min_size"]) if filters.get("min_size") else None
+    max_sz  = parse_size(filters["max_size"]) if filters.get("max_size") else None
+    after_  = parse_date(filters["after"])    if filters.get("after")    else None
+    before_ = parse_date(filters["before"])   if filters.get("before")   else None
+    if not any([min_sz, max_sz, after_, before_]):
+        return None
+    return make_filter(min_size=min_sz, max_size=max_sz, after_ts=after_, before_ts=before_)
+
+
 def _run(target: dict, depth: str, types: list[str], output: str, filters: dict) -> None:
+    import json
+    import shutil
+    import time
+
+    from rich.live import Live
+
     console.print()
     console.print(Rule("[bold green]Recovery in progress[/bold green]", style="green"))
 
-    # Ensure output directory
     Path(output).mkdir(parents=True, exist_ok=True)
 
+    # ---- Virtual disk: delegate to CLI ----
     if target["mode"] == "virtual":
-        # Delegate to the typer CLI for virtual disk (VHD/VHDX/VMDK)
-        import subprocess as sp
         cmd = [
             sys.executable, "-m", "drt.main", "virtual-disk",
             "--file", target["value"],
@@ -418,42 +517,74 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
             "--types", ",".join(types),
         ]
         console.print(f"[dim]Running: {' '.join(cmd)}[/dim]\n")
-        sp.run(cmd)
+        subprocess.run(cmd)
         return
 
-    # Physical drive — call _run_scan directly
+    # ---- Physical drive ----
     from drt import artifacts, browser, carver, fat, mft, report, vss, writer
     from drt import reader as disk_reader
-    from drt.checkpoint import CheckpointWriter, delete as checkpoint_delete
-    from drt.filters import make_filter, parse_date, parse_size
+    from drt.checkpoint import CheckpointWriter
+    from drt import checkpoint as cp_mod
     from drt.progress import ProgressTracker, make_dashboard
     from drt.types import get_extensions_for_groups
-    import json, shutil, time
-
-    from rich.live import Live
 
     drive = target["value"]
 
-    # Build filter
-    file_filter = None
-    try:
-        from drt.filters import make_filter, parse_size, parse_date
-        file_filter = make_filter(
-            min_size=parse_size(filters["min_size"]) if filters.get("min_size") else None,
-            max_size=parse_size(filters["max_size"]) if filters.get("max_size") else None,
-            after=parse_date(filters["after"])       if filters.get("after")    else None,
-            before=parse_date(filters["before"])     if filters.get("before")   else None,
-        )
-    except Exception:
-        pass
+    # ---- Check for existing checkpoint ----
+    resume_carve_offset = 0
+    phases_done: list[str] = []
+    files_found     = 0
+    bytes_recovered = 0
+    index           = 0
 
-    # Open disk
+    existing_cp = cp_mod.load(output)
+    if existing_cp:
+        cp_drive = existing_cp.get("drive", "")
+        cp_ts    = existing_cp.get("last_checkpoint", "unknown")
+        console.print()
+        console.print(Panel(
+            f"[bold yellow]Checkpoint found[/bold yellow]\n\n"
+            f"  Drive:      [cyan]{cp_drive}[/cyan]\n"
+            f"  Depth:      [cyan]{existing_cp.get('depth')}[/cyan]\n"
+            f"  Types:      [cyan]{', '.join(existing_cp.get('type_groups', []))}[/cyan]\n"
+            f"  Saved at:   [dim]{cp_ts}[/dim]\n"
+            f"  Phases done: [cyan]{', '.join(existing_cp.get('phases_completed', [])) or 'none'}[/cyan]\n"
+            f"  Files found: [cyan]{existing_cp.get('files_found', 0)}[/cyan]\n"
+            f"  Carve offset: [cyan]{_fmt_bytes(existing_cp.get('carve_offset', 0))}[/cyan]",
+            title="Resume?",
+            border_style="yellow",
+        ))
+        do_resume = Confirm.ask("\nResume from this checkpoint?", default=True)
+        if do_resume:
+            phases_done         = existing_cp.get("phases_completed", [])
+            files_found         = existing_cp.get("files_found", 0)
+            index               = existing_cp.get("next_index", 0)
+            resume_carve_offset = existing_cp.get("carve_offset", 0)
+            bytes_recovered     = 0   # not tracked in checkpoint; cosmetic only
+            # Use settings from checkpoint if they differ
+            depth  = existing_cp.get("depth",       depth)
+            types  = existing_cp.get("type_groups",  types)
+            drive  = existing_cp.get("drive",        drive)
+            console.print(f"[green]Resuming — skipping phases: {phases_done}[/green]")
+            console.print(f"[green]Carve will start from {_fmt_bytes(resume_carve_offset)}[/green]\n")
+        else:
+            cp_mod.delete(output)
+            console.print("[dim]Starting fresh.[/dim]\n")
+
+    # ---- Build filter ----
+    try:
+        file_filter = _build_filter(filters)
+    except ValueError as exc:
+        console.print(f"[yellow]Filter warning: {exc} — no filter applied.[/yellow]")
+        file_filter = None
+
+    # ---- Open disk ----
     try:
         handle = disk_reader.open_disk(drive)
     except OSError as exc:
         console.print(f"\n[bold red]Cannot open drive:[/bold red] {exc}")
         console.print(
-            "\nThis usually means one of:\n"
+            "\nThis usually means:\n"
             "  • Not running as Administrator\n"
             "  • The drive letter is wrong\n"
             "  • The drive is disconnected\n"
@@ -474,19 +605,12 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
     console.print(f"Loaded [cyan]{len(patterns)}[/cyan] file signature patterns.\n")
 
     writer.ensure_structure(output)
-    scan_report  = report.new_report(drive, depth, types)
-    start_time   = time.monotonic()
+    scan_report = report.new_report(drive, depth, types)
+    start_time  = time.monotonic()
 
-    # Drive letter for artifacts scan
-    stripped = drive.lstrip("\\").lstrip(".")
-    drive_letter = stripped[:2].upper() if len(stripped) >= 2 and stripped[1] == ":" else "C:"
+    drive_letter = _drive_letter_from_path(drive)
 
-    files_found     = 0
-    bytes_recovered = 0
-    index           = 0
-    phases_done: list[str] = []
-
-    # Extension→group lookup
+    # ---- Extension → group lookup ----
     _ext_group: dict[str, str] = {}
     def _group_for_ext(ext: str) -> str:
         if not _ext_group:
@@ -497,208 +621,260 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
         return _ext_group.get(ext.lower(), "other")
 
     tracker = ProgressTracker(total_bytes=total_bytes, drive=drive, current_phase="Initializing")
+    tracker.bytes_scanned   = resume_carve_offset
+    tracker.carve_offset    = resume_carve_offset
     tracker.record_sample()
 
     def _build_cp() -> dict:
         return {
             "tool": "DataRecoveryTool", "version": "0.1.0",
             "drive": drive, "depth": depth, "type_groups": types,
-            "output_dir": output, "phases_completed": phases_done,
+            "output_dir": output, "phases_completed": list(phases_done),
             "carve_offset": tracker.carve_offset,
             "files_found": files_found, "next_index": index + 1,
         }
 
-    cw = CheckpointWriter(output, _build_cp, interval_seconds=60)
+    # Write an immediate checkpoint so resume works even from the start
+    cp_mod.save(output, _build_cp())
+
+    cw = CheckpointWriter(output, _build_cp, interval_seconds=30)
     cw.start()
+
+    def _record(ext: str, size: int, name: str, location: str) -> None:
+        nonlocal files_found, bytes_recovered, index
+        files_found += 1
+        bytes_recovered += size
+        index += 1
+        grp = _group_for_ext(ext)
+        tracker.files_by_group[grp] = tracker.files_by_group.get(grp, 0) + 1
+        tracker.recent_finds.append({
+            "extension": ext, "name": name,
+            "size_bytes": size, "offset_or_path": location,
+        })
 
     try:
         with Live(make_dashboard(tracker), refresh_per_second=4, console=console) as live:
 
-            # Phase 1 — MFT
-            tracker.current_phase = "Phase 1/6: MFT Scan"
-            live.update(make_dashboard(tracker))
-            try:
-                for entry in mft.scan(handle, wanted_extensions):
-                    ext  = entry.get("extension", "")
-                    size = entry.get("size_bytes", 0)
-                    if file_filter and not file_filter(size, None):
-                        continue
-                    files_found += 1; index += 1; bytes_recovered += size
-                    tracker.files_by_group[_group_for_ext(ext)] = tracker.files_by_group.get(_group_for_ext(ext), 0) + 1
-                    tracker.recent_finds.append({"extension": ext, "name": entry.get("name", f"mft_{index}"), "size_bytes": size, "offset_or_path": f"MFT {entry.get('mft_record','?')}"})
-                    content = entry.get("resident_data", b"") or mft.extract_file_content(handle, entry.get("data_runs",[]), entry.get("bytes_per_cluster",0), size)
-                    out_path_str = str(writer.write_file(output, ext, content, index)) if content else "(metadata only)"
-                    report.add_found_file(scan_report, ext, 0, out_path_str, size)
-                    live.update(make_dashboard(tracker))
-            except Exception:
-                pass
-            phases_done.append("mft")
+            def _refresh() -> None:
+                live.update(make_dashboard(tracker))
 
-            # Phase 2 — FAT
-            tracker.current_phase = "Phase 2/6: FAT Scan"
-            live.update(make_dashboard(tracker))
-            try:
-                fat_bpb   = fat.read_bpb(handle)
-                fat_table = fat.read_fat_table(handle, fat_bpb) if fat_bpb else []
-                entries   = list(fat.iter_deleted_entries(handle, fat_bpb, wanted_extensions)) if fat_bpb else fat.scan(handle, wanted_extensions)
-                for entry in entries:
-                    ext  = entry.get("extension", "")
-                    size = entry.get("size_bytes", 0)
-                    if file_filter and not file_filter(size, None):
-                        continue
-                    files_found += 1; index += 1; bytes_recovered += size
-                    tracker.files_by_group[_group_for_ext(ext)] = tracker.files_by_group.get(_group_for_ext(ext), 0) + 1
-                    tracker.recent_finds.append({"extension": ext, "name": entry.get("name", f"fat_{index}"), "size_bytes": size, "offset_or_path": f"cluster {entry.get('first_cluster','?')}"})
-                    content = b""
-                    if fat_bpb and fat_table:
-                        fc = entry.get("first_cluster", 0)
-                        if fc >= 2 and size > 0:
-                            clusters = fat.follow_cluster_chain(fat_table, fc)
-                            if clusters:
-                                content = fat.read_cluster_chain(handle, fat_bpb, clusters, size)
-                    out_path_str = str(writer.write_file(output, ext, content, index)) if content else "(metadata only)"
-                    report.add_found_file(scan_report, ext, 0, out_path_str, size)
-                    live.update(make_dashboard(tracker))
-            except Exception:
-                pass
-            phases_done.append("fat")
+            # ---- Phase 1: MFT ----
+            if "mft" not in phases_done:
+                tracker.current_phase = "Phase 1/6: MFT Scan"
+                _refresh()
+                try:
+                    for entry in mft.scan(handle, wanted_extensions):
+                        ext  = entry.get("extension", "")
+                        size = entry.get("size_bytes", 0)
+                        if file_filter and not file_filter(size, None):
+                            continue
+                        content = (
+                            entry.get("resident_data", b"")
+                            or mft.extract_file_content(
+                                handle,
+                                entry.get("data_runs", []),
+                                entry.get("bytes_per_cluster", 0),
+                                size,
+                            )
+                        )
+                        name = entry.get("name", f"mft_{index+1}")
+                        _record(ext, size, name, f"MFT {entry.get('mft_record','?')}")
+                        out_path_str = str(writer.write_file(output, ext, content, index)) if content else "(metadata only)"
+                        report.add_found_file(scan_report, ext, 0, out_path_str, size)
+                        _refresh()
+                except Exception:
+                    pass
+                phases_done.append("mft")
+                cp_mod.save(output, _build_cp())
+
+            # ---- Phase 2: FAT ----
+            if "fat" not in phases_done:
+                tracker.current_phase = "Phase 2/6: FAT Scan"
+                _refresh()
+                try:
+                    fat_bpb   = fat.read_bpb(handle)
+                    fat_table = fat.read_fat_table(handle, fat_bpb) if fat_bpb else []
+                    entries   = (
+                        list(fat.iter_deleted_entries(handle, fat_bpb, wanted_extensions))
+                        if fat_bpb else fat.scan(handle, wanted_extensions)
+                    )
+                    for entry in entries:
+                        ext  = entry.get("extension", "")
+                        size = entry.get("size_bytes", 0)
+                        if file_filter and not file_filter(size, None):
+                            continue
+                        content = b""
+                        if fat_bpb and fat_table:
+                            fc = entry.get("first_cluster", 0)
+                            if fc >= 2 and size > 0:
+                                clusters = fat.follow_cluster_chain(fat_table, fc)
+                                if clusters:
+                                    content = fat.read_cluster_chain(handle, fat_bpb, clusters, size)
+                        name = entry.get("name", f"fat_{index+1}")
+                        _record(ext, size, name, f"cluster {entry.get('first_cluster','?')}")
+                        out_path_str = str(writer.write_file(output, ext, content, index)) if content else "(metadata only)"
+                        report.add_found_file(scan_report, ext, 0, out_path_str, size)
+                        _refresh()
+                except Exception:
+                    pass
+                phases_done.append("fat")
+                cp_mod.save(output, _build_cp())
 
             if depth in ("deep", "full-carve"):
-                # Phase 3 — VSS
-                tracker.current_phase = "Phase 3/6: Volume Shadow Copies"
-                live.update(make_dashboard(tracker))
-                try:
-                    for entry in vss.scan(wanted_extensions):
-                        ext  = entry.get("extension", "")
-                        size = entry.get("size_bytes", 0)
-                        src  = entry.get("path", "")
-                        if file_filter and not file_filter(size, None):
-                            continue
-                        files_found += 1; index += 1; bytes_recovered += size
-                        tracker.files_by_group[_group_for_ext(ext)] = tracker.files_by_group.get(_group_for_ext(ext), 0) + 1
-                        tracker.recent_finds.append({"extension": ext, "name": entry.get("name", f"vss_{index}"), "size_bytes": size, "offset_or_path": entry.get("shadow_id","")})
-                        out_path_str = "(copy failed)"
-                        if src and os.path.isfile(src):
-                            try:
-                                dest = writer.get_output_path(output, ext, index)
-                                dest.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.copy2(src, str(dest))
-                                out_path_str = str(dest)
-                            except Exception:
-                                pass
-                        report.add_found_file(scan_report, ext, 0, out_path_str, size)
-                        live.update(make_dashboard(tracker))
-                except Exception:
-                    pass
-                phases_done.append("vss")
 
-                # Phase 4 — Artifacts
-                tracker.current_phase = "Phase 4/6: Windows Artifacts"
-                live.update(make_dashboard(tracker))
-                try:
-                    for entry in artifacts.scan(drive_letter):
-                        ext  = entry.get("extension", "")
-                        size = entry.get("size_bytes", 0)
-                        if ext not in wanted_extensions and ext != "":
-                            continue
-                        if file_filter and not file_filter(size, None):
-                            continue
-                        files_found += 1; index += 1; bytes_recovered += size
-                        source = entry.get("source", "")
-                        if source == "recycle_bin":
-                            name = Path(entry.get("original_path", f"recycled_{index}")).name
-                            src_file = entry.get("r_file_path", "")
-                        elif source == "lnk":
-                            name = Path(entry.get("lnk_path", f"lnk_{index}")).name
-                            src_file = entry.get("lnk_path", "")
-                        else:
-                            name = f"artifact_{index}"
-                            src_file = entry.get("pf_path", "")
-                        group = _group_for_ext(ext) if ext else "artifacts"
-                        tracker.files_by_group[group] = tracker.files_by_group.get(group, 0) + 1
-                        tracker.recent_finds.append({"extension": ext, "name": name, "size_bytes": size, "offset_or_path": source})
-                        out_path_str = "(metadata only)"
-                        if src_file and os.path.isfile(src_file):
-                            try:
-                                dest = writer.get_output_path(output, ext or ".bin", index)
-                                dest.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.copy2(src_file, str(dest))
-                                out_path_str = str(dest)
-                            except Exception:
-                                pass
-                        report.add_found_file(scan_report, ext or ".bin", 0, out_path_str, size)
-                        live.update(make_dashboard(tracker))
-                except Exception:
-                    pass
-                phases_done.append("artifacts")
-
-                # Phase 5 — Browser data
-                tracker.current_phase = "Phase 5/6: Browser History"
-                live.update(make_dashboard(tracker))
-                try:
-                    browser_data = browser.scan()
-                    if browser_data:
-                        browser_base = Path(output) / "BrowserData"
-                        browser_base.mkdir(parents=True, exist_ok=True)
-                        for bname, history in browser_data.items():
-                            if not history:
+                # ---- Phase 3: VSS ----
+                if "vss" not in phases_done:
+                    tracker.current_phase = "Phase 3/6: Volume Shadow Copies"
+                    _refresh()
+                    try:
+                        for entry in vss.scan(wanted_extensions):
+                            ext  = entry.get("extension", "")
+                            size = entry.get("size_bytes", 0)
+                            src  = entry.get("path", "")
+                            if file_filter and not file_filter(size, None):
                                 continue
-                            bdir = browser_base / bname
-                            bdir.mkdir(exist_ok=True)
-                            (bdir / "history.json").write_text(
-                                json.dumps(history, indent=2, default=str), encoding="utf-8"
-                            )
-                            tracker.files_by_group["browser"] = tracker.files_by_group.get("browser", 0) + len(history)
-                            files_found += len(history)
-                            tracker.recent_finds.append({"extension": ".json", "name": f"{bname}/history.json", "size_bytes": 0, "offset_or_path": f"{len(history)} URLs"})
-                            live.update(make_dashboard(tracker))
-                except Exception:
-                    pass
-                phases_done.append("browser")
+                            name = entry.get("name", f"vss_{index+1}")
+                            _record(ext, size, name, entry.get("shadow_id", ""))
+                            out_path_str = "(copy failed)"
+                            if src and os.path.isfile(src):
+                                try:
+                                    dest = writer.get_output_path(output, ext, index)
+                                    dest.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy2(src, str(dest))
+                                    out_path_str = str(dest)
+                                except Exception:
+                                    pass
+                            report.add_found_file(scan_report, ext, 0, out_path_str, size)
+                            _refresh()
+                    except Exception:
+                        pass
+                    phases_done.append("vss")
+                    cp_mod.save(output, _build_cp())
 
-            # Phase 6 — Deep carve (always)
+                # ---- Phase 4: Artifacts ----
+                if "artifacts" not in phases_done:
+                    tracker.current_phase = "Phase 4/6: Windows Artifacts"
+                    _refresh()
+                    try:
+                        for entry in artifacts.scan(drive_letter):
+                            ext  = entry.get("extension", "")
+                            size = entry.get("size_bytes", 0)
+                            if ext not in wanted_extensions and ext != "":
+                                continue
+                            if file_filter and not file_filter(size, None):
+                                continue
+                            source = entry.get("source", "")
+                            if source == "recycle_bin":
+                                name     = Path(entry.get("original_path", f"recycled_{index+1}")).name
+                                src_file = entry.get("r_file_path", "")
+                            elif source == "lnk":
+                                name     = Path(entry.get("lnk_path", f"lnk_{index+1}")).name
+                                src_file = entry.get("lnk_path", "")
+                            else:
+                                name     = f"artifact_{index+1}"
+                                src_file = entry.get("pf_path", "")
+                            _record(ext or ".bin", size, name, source)
+                            out_path_str = "(metadata only)"
+                            if src_file and os.path.isfile(src_file):
+                                try:
+                                    dest = writer.get_output_path(output, ext or ".bin", index)
+                                    dest.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy2(src_file, str(dest))
+                                    out_path_str = str(dest)
+                                except Exception:
+                                    pass
+                            report.add_found_file(scan_report, ext or ".bin", 0, out_path_str, size)
+                            _refresh()
+                    except Exception:
+                        pass
+                    phases_done.append("artifacts")
+                    cp_mod.save(output, _build_cp())
+
+                # ---- Phase 5: Browser ----
+                if "browser" not in phases_done:
+                    tracker.current_phase = "Phase 5/6: Browser History"
+                    _refresh()
+                    try:
+                        browser_data = browser.scan()
+                        if browser_data:
+                            browser_base = Path(output) / "BrowserData"
+                            browser_base.mkdir(parents=True, exist_ok=True)
+                            for bname, history in browser_data.items():
+                                if not history:
+                                    continue
+                                bdir = browser_base / bname
+                                bdir.mkdir(exist_ok=True)
+                                (bdir / "history.json").write_text(
+                                    json.dumps(history, indent=2, default=str),
+                                    encoding="utf-8",
+                                )
+                                n = len(history)
+                                tracker.files_by_group["browser"] = tracker.files_by_group.get("browser", 0) + n
+                                files_found += n
+                                tracker.recent_finds.append({
+                                    "extension": ".json",
+                                    "name": f"{bname}/history.json",
+                                    "size_bytes": 0,
+                                    "offset_or_path": f"{n} URLs",
+                                })
+                                _refresh()
+                    except Exception:
+                        pass
+                    phases_done.append("browser")
+                    cp_mod.save(output, _build_cp())
+
+            # ---- Phase 6: Carve ----
             tracker.current_phase = "Phase 6/6: Deep Carve"
             tracker.record_sample()
-            live.update(make_dashboard(tracker))
+            _refresh()
 
             def _on_progress(processed: int, total: int) -> None:
-                tracker.bytes_scanned = processed
-                tracker.carve_offset  = processed
+                tracker.bytes_scanned = resume_carve_offset + processed
+                tracker.carve_offset  = resume_carve_offset + processed
                 tracker.record_sample()
 
-            for hit in carver.carve_disk(handle, total_bytes, patterns, _on_progress):
-                raw_data = hit["chunk_data"][
-                    hit["disk_offset"] - hit["chunk_offset"]:
-                    hit["disk_offset"] - hit["chunk_offset"] + hit["estimated_size"]
-                ]
+            for hit in carver.carve_disk(
+                handle, total_bytes, patterns, _on_progress,
+                start_offset=resume_carve_offset,
+            ):
+                ext      = hit["extension"]
+                max_read = min(hit["max_size"], total_bytes - hit["disk_offset"])
+
+                # Read the full file from disk (not just the 1 MB scan chunk)
+                raw_data = disk_reader.read_sectors(handle, hit["disk_offset"], max_read)
                 if not raw_data:
                     continue
-                ext  = hit["extension"]
+
+                # Trim to natural EOF where possible (avoids garbage at end)
+                raw_data = _trim_to_eof(raw_data, ext)
                 size = len(raw_data)
+
                 if file_filter and not file_filter(size, None):
                     continue
-                files_found += 1; bytes_recovered += size; index += 1
-                tracker.files_by_group[_group_for_ext(ext)] = tracker.files_by_group.get(_group_for_ext(ext), 0) + 1
-                tracker.recent_finds.append({"extension": ext, "name": f"recovered_{index:04d}{ext}", "size_bytes": size, "offset_or_path": f"0x{hit['disk_offset']:X}"})
+
+                name = f"carved_{index+1:05d}{ext}"
+                _record(ext, size, name, f"0x{hit['disk_offset']:X}")
                 out_path = writer.write_file(output, ext, raw_data, index)
                 report.add_found_file(scan_report, ext, hit["disk_offset"], str(out_path), size)
-                live.update(make_dashboard(tracker))
+                _refresh()
 
             tracker.bytes_scanned = total_bytes
             tracker.current_phase = "Complete"
             tracker.record_sample()
-            live.update(make_dashboard(tracker))
+            _refresh()
 
     finally:
         cw.stop()
+        # Save a final checkpoint on interrupt so resume works
+        cp_mod.save(output, _build_cp())
         disk_reader.close_disk(handle)
 
-    checkpoint_delete(output)
+    cp_mod.delete(output)
     elapsed = time.monotonic() - start_time
     report.finalize_report(scan_report, elapsed)
     report_path = report.write_report(scan_report, output)
 
-    # Summary
+    # ---- Summary ----
     console.print()
     console.print(Rule("[bold green]Recovery Complete[/bold green]", style="green"))
     console.print()
@@ -706,18 +882,20 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
     s = Table(title="Summary", show_lines=True)
     s.add_column("Metric",  style="cyan")
     s.add_column("Value",   style="white", justify="right")
-    s.add_row("Files found",      str(files_found))
-    s.add_row("Data recovered",   _fmt_bytes(bytes_recovered))
-    s.add_row("Duration",         f"{elapsed:.1f}s")
-    s.add_row("Output folder",    output)
-    s.add_row("Report",           str(report_path))
+    s.add_row("Files found",     str(files_found))
+    s.add_row("Data recovered",  _fmt_bytes(bytes_recovered))
+    s.add_row("Duration",        f"{elapsed:.1f}s")
+    s.add_row("Output folder",   output)
+    s.add_row("Report",          str(report_path))
     console.print(s)
 
     if scan_report["stats"]["by_type"]:
         bt = Table(title="Files by Type", show_lines=False)
         bt.add_column("Extension", style="cyan")
         bt.add_column("Count",     justify="right")
-        for ext_key, count in sorted(scan_report["stats"]["by_type"].items(), key=lambda kv: kv[1], reverse=True):
+        for ext_key, count in sorted(
+            scan_report["stats"]["by_type"].items(), key=lambda kv: kv[1], reverse=True
+        ):
             bt.add_row(f".{ext_key}", str(count))
         console.print(bt)
 
@@ -742,7 +920,7 @@ def main() -> None:
     depth   = _choose_depth()
     types   = _choose_types()
     output  = _choose_output()
-    filters = _choose_filters()
+    filters = _choose_filters(types)
 
     if not _confirm(target, depth, types, output, filters):
         console.print("\nCancelled.\n")
@@ -751,9 +929,8 @@ def main() -> None:
     try:
         _run(target, depth, types, output, filters)
     except KeyboardInterrupt:
-        console.print("\n\n[yellow]Scan interrupted by user.[/yellow]")
-        console.print(f"Partial results (if any) are in: [cyan]{output}[/cyan]")
-        console.print("Run [bold]python wizard.py[/bold] again to start fresh, or use [bold]drt resume[/bold] to continue.")
+        console.print("\n\n[yellow]Scan interrupted. Checkpoint saved.[/yellow]")
+        console.print(f"Run [bold]python wizard.py[/bold] again with the same output folder to resume.")
     finally:
         input("\nPress Enter to exit...")
 

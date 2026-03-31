@@ -165,15 +165,17 @@ def iter_sectors(
     handle: int,
     total_bytes: int,
     chunk_size: int = 1024 * 1024,
+    start_offset: int = 0,
 ) -> Iterator[tuple[int, bytes]]:
     """
     Yield (offset, data) tuples, reading the disk in chunk_size increments.
 
+    start_offset — begin iteration from this byte position (sector-aligned).
     chunk_size is automatically aligned up to the nearest sector boundary.
     Unreadable sectors are logged to stderr and skipped; iteration continues.
     """
     aligned_chunk = _align_up(chunk_size, SECTOR_SIZE)
-    offset        = 0
+    offset        = (start_offset // SECTOR_SIZE) * SECTOR_SIZE  # align down
 
     while offset < total_bytes:
         remaining  = total_bytes - offset
