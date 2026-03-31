@@ -900,7 +900,9 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                 start_offset=resume_carve_offset,
             ):
                 ext      = hit["extension"]
-                max_read = min(hit["max_size"], total_bytes - hit["disk_offset"])
+                # Cap at 256 MB: ReadFile's byte count is a DWORD so ≥4 GB
+                # wraps to 0; also prevents OOM on video/archive signatures.
+                max_read = min(hit["max_size"], total_bytes - hit["disk_offset"], 256 * 1024 * 1024)
 
                 # Read the full file from disk (not just the 1 MB scan chunk)
                 raw_data = disk_reader.read_sectors(handle, hit["disk_offset"], max_read)

@@ -25,6 +25,11 @@ INVALID_HANDLE_VALUE    = ctypes.c_void_p(-1).value
 
 SECTOR_SIZE             = 512   # default; geometry IOCTL may refine this
 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+IOCTL_DISK_GET_LENGTH_INFO       = 0x0007405C   # returns partition/volume size
+
+# ReadFile nNumberOfBytesToRead is a DWORD — cap individual reads at 256 MB
+# to avoid DWORD overflow (4 GB wraps to 0) and prevent OOM on large reads.
+_MAX_READ_BYTES = 256 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -72,13 +77,38 @@ def close_disk(handle: int) -> None:
 
 def get_disk_size(handle: int) -> int:
     """
-    Return total disk size in bytes using IOCTL_DISK_GET_DRIVE_GEOMETRY_EX.
-    Returns 0 if the IOCTL fails.
+    Return the size of the opened volume or disk in bytes.
+
+    Tries IOCTL_DISK_GET_LENGTH_INFO first — this returns the partition size
+    when the handle is a logical volume (e.g. \\\.\\D:), so we don't
+    accidentally scan beyond the selected partition onto adjacent volumes.
+    Falls back to IOCTL_DISK_GET_DRIVE_GEOMETRY_EX for physical disk handles.
+    Returns 0 if both IOCTLs fail.
     """
     kernel32  = ctypes.windll.kernel32
-    out_buf   = ctypes.create_string_buffer(64)
+    out_buf   = ctypes.create_string_buffer(16)
     bytes_ret = ctypes.wintypes.DWORD(0)
 
+    # Preferred: GET_LENGTH_INFORMATION = { LARGE_INTEGER Length } (8 bytes)
+    ok = kernel32.DeviceIoControl(
+        ctypes.c_void_p(handle),
+        IOCTL_DISK_GET_LENGTH_INFO,
+        None, 0,
+        out_buf, 16,
+        ctypes.byref(bytes_ret),
+        None,
+    )
+    if ok and bytes_ret.value >= 8:
+        try:
+            (length,) = struct.unpack_from("<q", out_buf.raw, 0)
+            if length > 0:
+                return length
+        except struct.error:
+            pass
+
+    # Fallback: DISK_GEOMETRY_EX (physical drives that don't support LENGTH_INFO)
+    out_buf   = ctypes.create_string_buffer(64)
+    bytes_ret = ctypes.wintypes.DWORD(0)
     ok = kernel32.DeviceIoControl(
         ctypes.c_void_p(handle),
         IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
@@ -87,11 +117,8 @@ def get_disk_size(handle: int) -> int:
         ctypes.byref(bytes_ret),
         None,
     )
-
     if not ok or bytes_ret.value < 32:
         return 0
-
-    # DISK_GEOMETRY_EX: Geometry(24 bytes) + DiskSize(LARGE_INTEGER, 8 bytes)
     try:
         (disk_size,) = struct.unpack_from("<q", out_buf.raw, 24)
         return max(disk_size, 0)
@@ -120,6 +147,10 @@ def read_sectors(handle: int, offset_bytes: int, length_bytes: int) -> bytes:
     Returns the raw bytes read (may be longer than length_bytes due to
     sector alignment padding). Returns empty bytes on read failure.
     """
+    # Guard: ReadFile's nNumberOfBytesToRead is a DWORD — values >= 4 GB wrap
+    # to 0 and cause silent failures. Cap here to prevent overflow and OOM.
+    length_bytes = min(length_bytes, _MAX_READ_BYTES)
+
     kernel32 = ctypes.windll.kernel32
 
     aligned_offset = (offset_bytes // SECTOR_SIZE) * SECTOR_SIZE

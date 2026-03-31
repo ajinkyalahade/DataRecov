@@ -245,14 +245,17 @@ def get_physical_disks() -> list[dict]:
         finally:
             kernel32.CloseHandle(ctypes.c_void_p(handle))
 
-        disks.append({
-            "path":          path,
-            "size_bytes":    size_bytes,
-            "model":         info["model"],
-            "serial_number": info["serial_number"],
-        })
+        if size_bytes > 0:
+            disks.append({
+                "path":          path,
+                "size_bytes":    size_bytes,
+                "model":         info["model"],
+                "serial_number": info["serial_number"],
+            })
 
-    return disks
+    # Drop zero-size entries — these are virtual adapters (Hyper-V, Docker,
+    # VPN) that respond to CreateFileW but hold no storage.
+    return [d for d in disks if d["size_bytes"] > 0]
 
 
 def _get_disk_size_from_handle(handle: int, kernel32) -> int:
