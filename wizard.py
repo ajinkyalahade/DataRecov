@@ -495,10 +495,29 @@ def _build_filter(filters: dict):
     return make_filter(min_size=min_sz, max_size=max_sz, after_ts=after_, before_ts=before_)
 
 
+def _find_checkpoint(base_output: str) -> tuple[str, dict] | None:
+    """
+    Scan <base_output>/recovery_*/ subdirectories for a saved checkpoint.
+    Returns (run_dir, checkpoint_dict) for the most recent one, or None.
+    """
+    from drt import checkpoint as cp_mod
+    base = Path(base_output)
+    if not base.exists():
+        return None
+    for subdir in sorted(base.glob("recovery_*"), reverse=True):
+        if not subdir.is_dir():
+            continue
+        cp = cp_mod.load(str(subdir))
+        if cp:
+            return str(subdir), cp
+    return None
+
+
 def _run(target: dict, depth: str, types: list[str], output: str, filters: dict) -> None:
     import json
     import shutil
     import time
+    from datetime import datetime
 
     from rich.live import Live
 
@@ -507,12 +526,15 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
 
     Path(output).mkdir(parents=True, exist_ok=True)
 
-    # ---- Virtual disk: delegate to CLI ----
+    # ---- Virtual disk: delegate to CLI (also gets a dated run folder) ----
     if target["mode"] == "virtual":
+        run_dir = str(Path(output) / f"recovery_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        console.print(f"Output folder: [cyan]{run_dir}[/cyan]\n")
         cmd = [
             sys.executable, "-m", "drt.main", "virtual-disk",
             "--file", target["value"],
-            "--out",  output,
+            "--out",  run_dir,
             "--depth", depth,
             "--types", ",".join(types),
         ]
@@ -530,46 +552,53 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
 
     drive = target["value"]
 
-    # ---- Check for existing checkpoint ----
+    # ---- Resolve run directory (resume existing or create new dated folder) ----
     resume_carve_offset = 0
     phases_done: list[str] = []
     files_found     = 0
     bytes_recovered = 0
     index           = 0
 
-    existing_cp = cp_mod.load(output)
-    if existing_cp:
-        cp_drive = existing_cp.get("drive", "")
-        cp_ts    = existing_cp.get("last_checkpoint", "unknown")
+    found = _find_checkpoint(output)
+    if found:
+        found_run_dir, existing_cp = found
+        cp_ts = existing_cp.get("last_checkpoint", "unknown")
         console.print()
         console.print(Panel(
             f"[bold yellow]Checkpoint found[/bold yellow]\n\n"
-            f"  Drive:      [cyan]{cp_drive}[/cyan]\n"
-            f"  Depth:      [cyan]{existing_cp.get('depth')}[/cyan]\n"
-            f"  Types:      [cyan]{', '.join(existing_cp.get('type_groups', []))}[/cyan]\n"
-            f"  Saved at:   [dim]{cp_ts}[/dim]\n"
-            f"  Phases done: [cyan]{', '.join(existing_cp.get('phases_completed', [])) or 'none'}[/cyan]\n"
-            f"  Files found: [cyan]{existing_cp.get('files_found', 0)}[/cyan]\n"
+            f"  Folder:       [cyan]{found_run_dir}[/cyan]\n"
+            f"  Drive:        [cyan]{existing_cp.get('drive', '?')}[/cyan]\n"
+            f"  Depth:        [cyan]{existing_cp.get('depth', '?')}[/cyan]\n"
+            f"  Types:        [cyan]{', '.join(existing_cp.get('type_groups', []))}[/cyan]\n"
+            f"  Saved at:     [dim]{cp_ts}[/dim]\n"
+            f"  Phases done:  [cyan]{', '.join(existing_cp.get('phases_completed', [])) or 'none'}[/cyan]\n"
+            f"  Files found:  [cyan]{existing_cp.get('files_found', 0)}[/cyan]\n"
             f"  Carve offset: [cyan]{_fmt_bytes(existing_cp.get('carve_offset', 0))}[/cyan]",
-            title="Resume?",
+            title="Resume previous scan?",
             border_style="yellow",
         ))
         do_resume = Confirm.ask("\nResume from this checkpoint?", default=True)
         if do_resume:
+            run_dir             = found_run_dir
             phases_done         = existing_cp.get("phases_completed", [])
             files_found         = existing_cp.get("files_found", 0)
             index               = existing_cp.get("next_index", 0)
             resume_carve_offset = existing_cp.get("carve_offset", 0)
-            bytes_recovered     = 0   # not tracked in checkpoint; cosmetic only
-            # Use settings from checkpoint if they differ
-            depth  = existing_cp.get("depth",       depth)
-            types  = existing_cp.get("type_groups",  types)
-            drive  = existing_cp.get("drive",        drive)
-            console.print(f"[green]Resuming — skipping phases: {phases_done}[/green]")
-            console.print(f"[green]Carve will start from {_fmt_bytes(resume_carve_offset)}[/green]\n")
+            depth               = existing_cp.get("depth",       depth)
+            types               = existing_cp.get("type_groups", types)
+            drive               = existing_cp.get("drive",       drive)
+            console.print(f"\n[green]Resuming into: {run_dir}[/green]")
+            console.print(f"[green]Skipping phases: {phases_done or 'none'}[/green]")
+            console.print(f"[green]Carve continues from {_fmt_bytes(resume_carve_offset)}[/green]\n")
         else:
-            cp_mod.delete(output)
-            console.print("[dim]Starting fresh.[/dim]\n")
+            cp_mod.delete(found_run_dir)
+            run_dir = str(Path(output) / f"recovery_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+            Path(run_dir).mkdir(parents=True, exist_ok=True)
+            console.print(f"[dim]Starting fresh in: {run_dir}[/dim]\n")
+    else:
+        run_dir = str(Path(output) / f"recovery_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        console.print(f"Output folder: [cyan]{run_dir}[/cyan]\n")
 
     # ---- Build filter ----
     try:
@@ -604,7 +633,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
     patterns          = carver.build_search_patterns(types)
     console.print(f"Loaded [cyan]{len(patterns)}[/cyan] file signature patterns.\n")
 
-    writer.ensure_structure(output)
+    writer.ensure_structure(run_dir)
     scan_report = report.new_report(drive, depth, types)
     start_time  = time.monotonic()
 
@@ -629,15 +658,15 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
         return {
             "tool": "DataRecoveryTool", "version": "0.1.0",
             "drive": drive, "depth": depth, "type_groups": types,
-            "output_dir": output, "phases_completed": list(phases_done),
+            "output_dir": run_dir, "phases_completed": list(phases_done),
             "carve_offset": tracker.carve_offset,
             "files_found": files_found, "next_index": index + 1,
         }
 
     # Write an immediate checkpoint so resume works even from the start
-    cp_mod.save(output, _build_cp())
+    cp_mod.save(run_dir, _build_cp())
 
-    cw = CheckpointWriter(output, _build_cp, interval_seconds=30)
+    cw = CheckpointWriter(run_dir, _build_cp, interval_seconds=30)
     cw.start()
 
     def _record(ext: str, size: int, name: str, location: str) -> None:
@@ -679,13 +708,13 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                         )
                         name = entry.get("name", f"mft_{index+1}")
                         _record(ext, size, name, f"MFT {entry.get('mft_record','?')}")
-                        out_path_str = str(writer.write_file(output, ext, content, index)) if content else "(metadata only)"
+                        out_path_str = str(writer.write_file(run_dir, ext, content, index)) if content else "(metadata only)"
                         report.add_found_file(scan_report, ext, 0, out_path_str, size)
                         _refresh()
                 except Exception:
                     pass
                 phases_done.append("mft")
-                cp_mod.save(output, _build_cp())
+                cp_mod.save(run_dir, _build_cp())
 
             # ---- Phase 2: FAT ----
             if "fat" not in phases_done:
@@ -712,13 +741,13 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                                     content = fat.read_cluster_chain(handle, fat_bpb, clusters, size)
                         name = entry.get("name", f"fat_{index+1}")
                         _record(ext, size, name, f"cluster {entry.get('first_cluster','?')}")
-                        out_path_str = str(writer.write_file(output, ext, content, index)) if content else "(metadata only)"
+                        out_path_str = str(writer.write_file(run_dir, ext, content, index)) if content else "(metadata only)"
                         report.add_found_file(scan_report, ext, 0, out_path_str, size)
                         _refresh()
                 except Exception:
                     pass
                 phases_done.append("fat")
-                cp_mod.save(output, _build_cp())
+                cp_mod.save(run_dir, _build_cp())
 
             if depth in ("deep", "full-carve"):
 
@@ -738,7 +767,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                             out_path_str = "(copy failed)"
                             if src and os.path.isfile(src):
                                 try:
-                                    dest = writer.get_output_path(output, ext, index)
+                                    dest = writer.get_output_path(run_dir, ext, index)
                                     dest.parent.mkdir(parents=True, exist_ok=True)
                                     shutil.copy2(src, str(dest))
                                     out_path_str = str(dest)
@@ -749,7 +778,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                     except Exception:
                         pass
                     phases_done.append("vss")
-                    cp_mod.save(output, _build_cp())
+                    cp_mod.save(run_dir, _build_cp())
 
                 # ---- Phase 4: Artifacts ----
                 if "artifacts" not in phases_done:
@@ -777,7 +806,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                             out_path_str = "(metadata only)"
                             if src_file and os.path.isfile(src_file):
                                 try:
-                                    dest = writer.get_output_path(output, ext or ".bin", index)
+                                    dest = writer.get_output_path(run_dir, ext or ".bin", index)
                                     dest.parent.mkdir(parents=True, exist_ok=True)
                                     shutil.copy2(src_file, str(dest))
                                     out_path_str = str(dest)
@@ -788,7 +817,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                     except Exception:
                         pass
                     phases_done.append("artifacts")
-                    cp_mod.save(output, _build_cp())
+                    cp_mod.save(run_dir, _build_cp())
 
                 # ---- Phase 5: Browser ----
                 if "browser" not in phases_done:
@@ -797,7 +826,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                     try:
                         browser_data = browser.scan()
                         if browser_data:
-                            browser_base = Path(output) / "BrowserData"
+                            browser_base = Path(run_dir) / "BrowserData"
                             browser_base.mkdir(parents=True, exist_ok=True)
                             for bname, history in browser_data.items():
                                 if not history:
@@ -821,7 +850,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
                     except Exception:
                         pass
                     phases_done.append("browser")
-                    cp_mod.save(output, _build_cp())
+                    cp_mod.save(run_dir, _build_cp())
 
             # ---- Phase 6: Carve ----
             tracker.current_phase = "Phase 6/6: Deep Carve"
@@ -854,7 +883,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
 
                 name = f"carved_{index+1:05d}{ext}"
                 _record(ext, size, name, f"0x{hit['disk_offset']:X}")
-                out_path = writer.write_file(output, ext, raw_data, index)
+                out_path = writer.write_file(run_dir, ext, raw_data, index)
                 report.add_found_file(scan_report, ext, hit["disk_offset"], str(out_path), size)
                 _refresh()
 
@@ -866,13 +895,13 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
     finally:
         cw.stop()
         # Save a final checkpoint on interrupt so resume works
-        cp_mod.save(output, _build_cp())
+        cp_mod.save(run_dir, _build_cp())
         disk_reader.close_disk(handle)
 
-    cp_mod.delete(output)
+    cp_mod.delete(run_dir)
     elapsed = time.monotonic() - start_time
     report.finalize_report(scan_report, elapsed)
-    report_path = report.write_report(scan_report, output)
+    report_path = report.write_report(scan_report, run_dir)
 
     # ---- Summary ----
     console.print()
@@ -885,7 +914,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
     s.add_row("Files found",     str(files_found))
     s.add_row("Data recovered",  _fmt_bytes(bytes_recovered))
     s.add_row("Duration",        f"{elapsed:.1f}s")
-    s.add_row("Output folder",   output)
+    s.add_row("Run folder",      run_dir)
     s.add_row("Report",          str(report_path))
     console.print(s)
 
@@ -899,7 +928,7 @@ def _run(target: dict, depth: str, types: list[str], output: str, filters: dict)
             bt.add_row(f".{ext_key}", str(count))
         console.print(bt)
 
-    console.print(f"\nAll recovered files are in: [bold cyan]{output}[/bold cyan]\n")
+    console.print(f"\nAll recovered files are in: [bold cyan]{run_dir}[/bold cyan]\n")
 
 
 # ---------------------------------------------------------------------------
